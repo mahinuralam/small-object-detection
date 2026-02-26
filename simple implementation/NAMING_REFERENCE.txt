@@ -1,0 +1,161 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        REFACTORED NAMING REFERENCE                           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ COMPONENT 1: Multi-Scale Feature Enhancement                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Old Name:  SimplifiedDPAModule                                              │
+│ New Name:  MultiScaleFeatureEnhancer (MSFE)                                 │
+│ File:      models/enhancements/msfe_module.py                               │
+│ Purpose:   Enhances features using multi-scale edge detection and attention │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ COMPONENT 2: Image Reconstruction Module                                    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Old Name:  ReconstructionHead                                               │
+│ New Name:  FeatureReconstructor (FR)                                        │
+│ File:      models/enhancements/feature_reconstructor.py                     │
+│ Purpose:   Reconstructs RGB images from FPN P2 features                     │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ COMPONENT 3: Difference-Based Feature Fusion                                │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Old Name:  DGFE (Difference Map Guided Feature Enhancement)                 │
+│ New Name:  DifferenceGuidedFeatureFusion (DGFF)                             │
+│ File:      models/enhancements/dgff_module.py                               │
+│ Purpose:   Uses reconstruction errors to guide feature enhancement          │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ MODEL 1: Multi-Scale Enhanced Detection                                     │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Old Name:  FasterRCNN_DPA                                                   │
+│ New Name:  MSFEFasterRCNN                                                   │
+│ File:      models/msfe_fasterrcnn.py                                        │
+│ Purpose:   Faster R-CNN with multi-scale feature enhancement                │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ MODEL 2: Reconstruction-Guided Detection                                    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Old Name:  FasterRCNN_SRTOD                                                 │
+│ New Name:  ReconstructionGuidedDetector (RGD)                               │
+│ File:      models/rgd_model.py                                              │
+│ Purpose:   Uses image reconstruction to guide small object detection        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                           QUICK IMPORT GUIDE                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+NEW NAMES (Recommended):
+─────────────────────────
+from models.enhancements import MultiScaleFeatureEnhancer       # MSFE
+from models.enhancements import FeatureReconstructor           # FR
+from models.enhancements import DifferenceGuidedFeatureFusion  # DGFF
+from models.msfe_fasterrcnn import MSFEFasterRCNN
+from models.rgd_model import ReconstructionGuidedDetector
+
+LEGACY NAMES (Still supported):
+────────────────────────────────
+from models.enhancements import SimplifiedDPAModule
+from models.enhancements import ReconstructionHead
+from models.enhancements import DGFE
+from models.dpa_model import FasterRCNN_DPA
+from models.srtod_model import FasterRCNN_SRTOD
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              USAGE EXAMPLE                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+# Example 1: Using MSFE Model
+from models.msfe_fasterrcnn import MSFEFasterRCNN
+
+model = MSFEFasterRCNN(
+    num_classes=11,
+    enhance_levels=['0', '1'],  # P3, P4
+    pretrained=True
+)
+
+# Training
+losses = model(images, targets)
+
+# Inference
+model.eval()
+detections = model(images)
+
+# Example 2: Using RGD Model
+from models.rgd_model import ReconstructionGuidedDetector
+
+model = ReconstructionGuidedDetector(
+    num_classes=11,
+    learnable_thresh=0.0156862,
+    pretrained_backbone=True
+)
+
+# Training
+losses = model(images, targets)
+# losses includes: loss_reconstruction, loss_rpn_box_reg, loss_classifier, etc.
+
+# Inference
+model.eval()
+detections = model(images)
+
+# Get reconstruction visualization
+recon_outputs = model.get_reconstruction_outputs(images)
+# Returns: original, reconstructed, difference_map, binary_mask, threshold
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         PERFORMANCE REFERENCE                                ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Model                          | mAP@0.5 | mAP (0.5:0.95) | Status
+─────────────────────────────────────────────────────────────────────
+Baseline Faster R-CNN          | 38.02%  | -              | ✓ Trained
+MSFE (Multi-Scale Enhanced)    | 43.44%  | -              | ✓ Trained
+RGD (Reconstruction-Guided)    | 38.83%  | 22.01%         | ✓ Trained
+
+Dataset: VisDrone-2018 (548 validation images, 37,771 objects)
+GPU: NVIDIA RTX 3090
+Training: 50 epochs max, early stopping
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                            KEY DIFFERENCES                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+MSFE Approach:
+- Direct feature enhancement on FPN levels
+- Multi-scale edge detection + attention
+- Lightweight, efficient
+- Best for overall mAP improvement
+
+RGD Approach:
+- Reconstruction-based spatial guidance
+- Learns where features are difficult to represent
+- Additional reconstruction loss
+- Better for understanding model behavior
+
+Both approaches are complementary and can potentially be combined.
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         FILES ORGANIZATION                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+models/
+├── msfe_fasterrcnn.py          ← New MSFE model
+├── rgd_model.py                ← New RGD model
+├── dpa_model.py                ← Legacy (still works)
+├── srtod_model.py              ← Legacy (still works)
+└── enhancements/
+    ├── msfe_module.py          ← New multi-scale enhancer
+    ├── feature_reconstructor.py ← New reconstructor
+    ├── dgff_module.py          ← New guided fusion
+    ├── dpa_module.py           ← Legacy (still works)
+    ├── reconstruction_head.py   ← Legacy (still works)
+    └── dgfe_module.py          ← Legacy (still works)
+
+All trained model checkpoints remain compatible with both naming conventions!
+

@@ -1,0 +1,250 @@
+# ========================================
+# Small Object Detection Project .gitignore
+# ========================================
+
+# ============ DATASETS ============
+# All dataset folders (HEAVY: 2.2GB+)
+dataset/
+data/VisDrone*/
+data/COCO/
+data/raw/
+data/processed/
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+
+# Keep data folder structure
+!data/.gitkeep
+!data/README.md
+
+# ============ MODEL CHECKPOINTS ============
+# PyTorch model files (HEAVY: 300MB+ each)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# TensorFlow/Keras models
+*.h5
+*.keras
+*.pb
+saved_model/
+
+# ONNX models
+*.onnx
+
+# Keep only best models (uncomment if you want to track specific models)
+# !**/best_model.pth
+# !**/best_model_*.pth
+# !models/reconstructor/best_reconstructor.pth
+
+# ============ TRAINING OUTPUTS ============
+# All results directories
+results/
+outputs/
+runs/
+checkpoints/
+results/outputs*/
+results/baseline_detector_test/
+results/visualizations*/
+results/improved/
+results/debug/
+results/final_results/
+results/full_pipeline_evaluation/
+
+# Logs
+logs/
+*.log
+*.log.*
+training.log
+cddpa_training.log
+
+# TensorBoard
+events.out.tfevents.*
+tensorboard/
+
+# Weights & Biases
+wandb/
+
+# ============ VISUALIZATIONS ============
+# Generated images and videos (keep source, ignore outputs)
+results/**/*.png
+results/**/*.jpg
+results/**/*.jpeg
+results/**/*.gif
+results/**/*.mp4
+results/**/*.avi
+
+# But keep example images in docs
+!docs/**/*.png
+!docs/**/*.jpg
+!README_assets/**/*.png
+
+# ============ EVALUATION OUTPUTS ============
+# JSON detection files
+results/**/*.json
+*_detections.json
+*_metadata.json
+
+# CSV results
+results/**/*.csv
+*_results.csv
+
+# ============ PYTHON ============
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# ============ VIRTUAL ENVIRONMENTS ============
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+conda_env/
+
+# ============ JUPYTER NOTEBOOK ============
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# Jupyter Notebook output
+*_files/
+
+# ============ IDEs ============
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+.*.swp
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ============ OS ============
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# ============ TEMPORARY FILES ============
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.cache
+cache/
+
+# ============ COMPILED ============
+*.pyc
+*.pyo
+*.pyd
+*.dll
+*.exe
+*.o
+*.a
+
+# ============ PROFILING ============
+*.prof
+*.lprof
+.profile
+
+# ============ COVERAGE ============
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# ============ MLFLOW ============
+mlruns/
+mlartifacts/
+
+# ============ DVC (Data Version Control) ============
+.dvc/
+*.dvc
+
+# ============ PROJECT SPECIFIC ============
+# Analysis notebooks outputs
+analysis/output/
+analysis/figures/
+analysis/*.png
+analysis/*.jpg
+
+# Tools outputs  
+tools/output/
+tools/cache/
+
+# Keep important files
+!requirements*.txt
+!*.md
+!*.py
+!*.json
+!*.yaml
+!*.yml
+!.gitkeep
+!LICENSE
+
+# ============ LARGE FILES WARNING ============
+# Add specific large files here if needed
+# Example:
+# specific_large_file.bin

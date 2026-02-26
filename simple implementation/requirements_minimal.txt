@@ -1,0 +1,42 @@
+# Core Deep Learning - Small Object Detection Research
+# Python 3.11.8 required
+# GPU: NVIDIA RTX 3090 24GB with CUDA 12.4
+
+# PyTorch Ecosystem (CUDA 12.4)
+torch==2.5.0
+torchvision==0.20.0
+torchmetrics==1.5.1
+pytorch-lightning==2.4.0
+
+# Computer Vision
+opencv-python==4.9.0.80
+opencv-python-headless==4.11.0.86
+albumentations==2.0.8
+albucore==0.0.24
+scikit-image==0.22.0
+Pillow==10.4.0
+
+# Data Science
+numpy==1.26.4
+pandas==2.1.4
+scipy==1.11.4
+
+# Visualization
+matplotlib==3.8.0
+seaborn==0.13.2
+
+# Machine Learning
+scikit-learn==1.5.2
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
+pathlib
+
+# Development (optional)
+jupyter
+jupyterlab
+ipython
+black
+autopep8
+pytest
