@@ -1,0 +1,248 @@
+Reconstruction Module Technical Deep-Dive
+=========================================
+
+Scope
+-----
+This document explains, in implementation-level detail, the following components used in the SR-TOD path:
+
+1) Reconstructor (ReconstructionHead)
+2) Reconstruction Error Map (Difference Map)
+3) Reconstruction-Guided Refinement (DGFE)
+
+All descriptions are aligned to the current codebase implementation.
+
+
+1. Reconstructor (ReconstructionHead)
+=====================================
+
+1.1 Purpose
+-----------
+The Reconstructor converts low-resolution P2 feature maps back into an image-like RGB reconstruction. Its role is not final image generation quality for visualization; it is to produce reconstruction residuals that reveal fine structures and tiny objects that are difficult to preserve in coarse feature abstractions.
+
+In this pipeline, the reconstructed image is used immediately to compute a difference map, which then guides DGFE.
+
+
+1.2 Inputs and Outputs
+----------------------
+Input:
+- P2 features: x in R^{N x 256 x H/4 x W/4}
+
+Output:
+- Reconstructed image: r_img in R^{N x 3 x H x W}, constrained to [0, 1] by final Sigmoid
+
+
+1.3 Internal Architecture (Exact Block Order)
+---------------------------------------------
+ReconstructionHead is composed of:
+
+A) Up_direct #1 (256 -> 128)
+- ConvTranspose2d(in=256, out=128, kernel=4, stride=2, padding=1)
+- DoubleConv(128 -> 128):
+  - Conv2d(3x3) + ReLU
+  - Conv2d(3x3) + ReLU
+
+B) Up_direct #2 (128 -> 64)
+- ConvTranspose2d(in=128, out=64, kernel=4, stride=2, padding=1)
+- DoubleConv(64 -> 64):
+  - Conv2d(3x3) + ReLU
+  - Conv2d(3x3) + ReLU
+
+C) OutConv (64 -> 3)
+- Conv2d(3x3)
+- Sigmoid
+
+Shape flow:
+- x:      (N, 256, H/4, W/4)
+- up1:    (N, 128, H/2, W/2)
+- up2:    (N,  64, H,   W)
+- r_img:  (N,   3, H,   W)
+
+
+1.4 Why This Works for Tiny-Object Pipelines
+--------------------------------------------
+Tiny objects are easily lost in downsampled feature representations. Reconstructing from P2 forces the network to model details that survive feature extraction. Regions reconstructed poorly often correspond to small/high-frequency structures, making them useful as guidance signals.
+
+
+1.5 Training Behavior
+---------------------
+ReconstructionHead is trained jointly with the detector, not as a standalone pretraining stage in this model path.
+
+Reconstruction loss:
+L_res = mean(|r_img - I|)
+
+where I is the unnormalized [0,1] target image tensor (img_inputs).
+
+
+2. Reconstruction Error Map (Difference Map)
+============================================
+
+2.1 Definition
+--------------
+The difference map is computed pixelwise between the reconstructed image and target image:
+
+Delta = (1/3) * sum_c |r_img_c - I_c|
+
+with shape:
+Delta in R^{N x 1 x H x W}
+
+This is a single-channel residual magnitude map.
+
+
+2.2 Operation Sequence
+----------------------
+1) Compute absolute RGB residual: abs(r_img - I)
+2) Sum over channel dimension
+3) Divide by 3 (channel mean)
+
+The division by 3 keeps magnitude scale normalized relative to RGB channel count.
+
+
+2.3 Interpretation
+------------------
+- Low Delta: area was easy to reconstruct from P2 features
+- High Delta: area was hard to reconstruct (often tiny objects, edges, small structures, fine textures)
+
+So Delta functions as a spatial prior indicating where features likely need amplification.
+
+
+2.4 Numerical and Practical Notes
+---------------------------------
+- r_img is constrained to [0,1] by Sigmoid.
+- img_inputs must also be in [0,1] (no mean/std normalization for this branch).
+- If img_inputs preprocessing is inconsistent, Delta becomes noisy and DGFE guidance quality degrades.
+
+
+3. Reconstruction-Guided Refinement (DGFE)
+===========================================
+
+3.1 Purpose
+-----------
+DGFE uses the difference map to refine P2 features before they are consumed by RPN/ROI detector heads. It combines:
+
+1) Spatial guidance from thresholded Delta
+2) Channel attention from pooled feature statistics
+
+Then fuses both to boost features in reconstruction-difficult regions.
+
+
+3.2 Inputs and Outputs
+----------------------
+Inputs:
+- x: P2 features in R^{N x C x Hf x Wf}, C=256
+- difference_map: Delta in R^{N x 1 x Hi x Wi}
+- learnable_thresh: scalar parameter t (initialized to 4/255)
+
+Output:
+- x_out in R^{N x 256 x Hf x Wf}
+
+Output shape equals input shape (interface-preserving for Faster R-CNN heads).
+
+
+3.3 DGFE Stage-by-Stage Mechanics
+---------------------------------
+
+Stage 1: Filtration (threshold to binary-like mask)
+M = (sign(Delta - t) + 1) * 0.5
+
+Meaning:
+- Delta > t -> mask near 1
+- Delta < t -> mask near 0
+
+Stage 2: Spatial Guidance
+- Resize M to feature resolution using nearest-neighbor interpolation:
+  M_tilde = Resize_nearest(M, Hf, Wf)
+- Repeat channels to match x:
+  M_c = repeat(M_tilde, C=256)
+
+Stage 3: Channel Reweighting (CBAM-style)
+- Compute global average pool and global max pool of x
+- Pass both through shared MLP:
+  Flatten -> FC(256->16) -> ReLU -> FC(16->256)
+- Sum both outputs:
+  A = MLP(avg_pool(x)) + MLP(max_pool(x))
+- Sigmoid gate and expand:
+  S = sigmoid(A), expand to N x 256 x Hf x Wf
+
+Stage 4: Fusion
+- Channel attended feature:
+  X_ca = x * S
+- Difference-guided boost:
+  x_out = X_ca * M_c + X_ca
+
+Equivalent form:
+x_out = X_ca * (1 + M_c)
+
+Interpretation:
+- If M_c=0: preserve channel-attended baseline
+- If M_c=1: amplify attended features in highlighted regions
+
+
+3.4 Why DGFE Is Effective Here
+------------------------------
+- Delta provides explicit spatial evidence of reconstruction difficulty.
+- Channel attention selects semantically useful channels.
+- Their combination boosts relevant structures while keeping original feature geometry.
+- No detector-head API changes are needed because tensor shape is preserved.
+
+
+4. Integration in SR-TOD Forward Path
+=====================================
+
+4.1 Core Runtime Flow
+---------------------
+1) Extract FPN features from backbone
+2) Use P2 to reconstruct image and compute Delta
+3) Refine P2 with DGFE(x, Delta, t)
+4) Replace features['0'] with refined P2
+5) Run standard Faster R-CNN RPN and ROI heads
+
+So the detector head remains standard; reconstruction and DGFE are feature-refinement modules before proposal/classification stages.
+
+
+4.2 Training Loss Composition
+-----------------------------
+Total optimization includes:
+- Detector losses (RPN + ROI)
+- Reconstruction loss (L1) weighted by loss_res_weight
+
+Conceptually:
+L_total = L_det + lambda * L_res
+
+where L_res = mean(|r_img - I|).
+
+
+4.3 Inference Behavior
+----------------------
+At inference time, the same reconstruction -> Delta -> DGFE refinement path runs to enhance P2 before final detection. Reconstruction loss is not computed in inference mode.
+
+
+5. Engineering Constraints and Failure Modes
+============================================
+
+5.1 Input Contract
+------------------
+img_inputs must remain [0,1]. If accidentally mean/std normalized, Delta semantics break.
+
+5.2 Threshold Sensitivity
+-------------------------
+The learnable threshold starts at 4/255. Poor optimization can make masks too sparse or too dense:
+- too sparse -> under-guidance
+- too dense -> over-boosting/noise amplification
+
+5.3 Texture-Heavy Backgrounds
+-----------------------------
+Strong background textures may produce high Delta even without objects, causing false emphasis. Balance through training and threshold learning is important.
+
+5.4 Compute Cost
+----------------
+Reconstruction and DGFE add overhead. In tile-heavy pipelines, this overhead scales with number of processed tiles.
+
+
+6. Summary
+==========
+
+- Reconstructor (RH) transforms P2 into an RGB reconstruction to expose information loss.
+- Difference map (Delta) converts reconstruction mismatch into a spatial guidance signal.
+- DGFE fuses thresholded spatial guidance with channel attention to refine P2.
+- Refined P2 is passed into standard Faster R-CNN detection heads without changing head architecture.
+- This design targets tiny-object recovery by turning reconstruction difficulty into detection-focused feature enhancement.

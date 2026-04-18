@@ -1,4 +1,4 @@
-from .baseline import get_baseline_model
-from .dpa_model import get_dpa_model, FasterRCNN_DPA
+from .cddpa_model import FasterRCNN_CDDPA
+from .srtod_model import SRTOD
 
-__all__ = ['get_baseline_model', 'get_dpa_model', 'FasterRCNN_DPA']
+__all__ = ['FasterRCNN_CDDPA', 'SRTOD']

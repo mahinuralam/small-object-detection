@@ -1,11 +1,14 @@
 """
-SAHI Inference Runner
-Runs detector on selected tiles and merges results with advanced strategies
+SAHI Inference Runner — Stages 1 & 3
+Runs any detector (CD-DPA or SR-TOD) on selected tiles and merges results.
+
+Used twice in the 4-stage pipeline:
+  Stage 1: CD-DPA on all SAHI tiles → GREEDYNMM merge for D_base
+  Stage 3: SR-TOD on K weak tiles   → GREEDYNMM merge for D_sr
 """
 import torch
 import numpy as np
 from typing import List, Tuple, Dict, Union
-from .detector_wrapper import BaseDetector
 
 
 class SAHIInferenceRunner:
@@ -25,7 +28,7 @@ class SAHIInferenceRunner:
     
     def __init__(
         self,
-        detector: BaseDetector,
+        detector,
         merge_iou_thresh: float = 0.6,
         postprocess_type: str = 'GREEDYNMM',
         postprocess_match_metric: str = 'IOS',
@@ -35,7 +38,8 @@ class SAHIInferenceRunner:
         Initialize SAHI runner
         
         Args:
-            detector: BaseDetector instance
+            detector: Any object with a predict(image) -> dict method
+                      (CDDPADetector, SRTODTileDetector, or BaseDetector)
             merge_iou_thresh: IoU threshold for merging tile detections
             postprocess_type: 'GREEDYNMM' or 'NMS'
             postprocess_match_metric: 'IOS' or 'IOU'

@@ -2,7 +2,11 @@
 SR-TOD Enhanced Faster R-CNN Training Script
 Self-Reconstructed Tiny Object Detection for VisDrone dataset
 Based on: https://github.com/Hiyuur/SR-TOD (ECCV 2024)
-"""
+Trains the full SR-TOD model end-to-end:
+  - Backbone + FPN  →  RH (Reconstruction Head)  →  Difference Map
+  - DGFE (Difference-Guided Feature Enhancement) on P2
+  - Standard Faster R-CNN detection losses  +  L1 reconstruction loss
+  - All components (RH, DGFE, learnable_thresh) train jointly."""
 
 import torch
 import torch.nn as nn
@@ -10,6 +14,7 @@ from torch.utils.data import DataLoader
 import torch.optim as optim
 import time
 import sys
+import argparse
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -154,25 +159,46 @@ def evaluate(model, data_loader, device):
     }
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train SR-TOD model on VisDrone')
+    parser.add_argument('--data-root', type=str, default=None,
+                        help='Path to VisDrone-2018 root directory')
+    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--num-epochs', type=int, default=50)
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='DataLoader workers (set 0 for restricted/sandboxed environments)')
+    parser.add_argument('--learning-rate', type=float, default=0.005)
+    parser.add_argument('--step-size', type=int, default=10)
+    parser.add_argument('--gamma', type=float, default=0.1)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--min-size', type=int, default=5)
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cuda', 'cpu'])
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='Directory to save checkpoints')
+    return parser.parse_args()
+
+
 def main():
     """Main training function"""
+    args = parse_args()
     
     # Configuration
     config = {
-        'dataset_root': Path(__file__).parent.parent.parent.parent / 'dataset' / 'VisDrone-2018',
-        'batch_size': 4,
-        'num_epochs': 50,
-        'learning_rate': 0.005,
+        'dataset_root': Path(args.data_root) if args.data_root else (Path(__file__).parent.parent.parent.parent / 'dataset' / 'VisDrone-2018'),
+        'batch_size': args.batch_size,
+        'num_epochs': args.num_epochs,
+        'num_workers': args.num_workers,
+        'learning_rate': args.learning_rate,
         'momentum': 0.9,
         'weight_decay': 0.0005,
-        'step_size': 10,
-        'gamma': 0.1,
+        'step_size': args.step_size,
+        'gamma': args.gamma,
         'num_classes': 10,  # VisDrone has 10 classes
         'learnable_thresh': 0.0156862,  # 4/255
-        'patience': 10,  # Early stopping patience
-        'output_dir': Path(__file__).parent.parent.parent / 'results' / 'outputs_srtod',
+        'patience': args.patience,  # Early stopping patience
+        'output_dir': Path(args.output_dir) if args.output_dir else (Path(__file__).parent.parent.parent / 'results' / 'outputs_srtod'),
         'log_file': Path(__file__).parent.parent.parent / 'logs' / 'train_srtod.log',
-        'min_size': 5  # Minimum box size to keep
+        'min_size': args.min_size  # Minimum box size to keep
     }
     
     # Create output directories
@@ -180,7 +206,12 @@ def main():
     config['log_file'].parent.mkdir(parents=True, exist_ok=True)
     
     # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.device == 'cuda':
+        device = torch.device('cuda')
+    elif args.device == 'cpu':
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*80}")
     print(f"SR-TOD Enhanced Faster R-CNN Training")
     print(f"{'='*80}")
@@ -203,7 +234,7 @@ def main():
         train_dataset,
         batch_size=config['batch_size'],
         shuffle=True,
-        num_workers=4,
+        num_workers=config['num_workers'],
         collate_fn=collate_fn,
         pin_memory=True
     )
@@ -212,7 +243,7 @@ def main():
         val_dataset,
         batch_size=config['batch_size'],
         shuffle=False,
-        num_workers=4,
+        num_workers=config['num_workers'],
         collate_fn=collate_fn,
         pin_memory=True
     )
@@ -227,8 +258,9 @@ def main():
     model.to(device)
     
     print(f"✓ Model initialized")
-    print(f"  - Reconstruction Head: P2 (256ch) → RGB (3ch)")
-    print(f"  - DGFE: Channel attention + spatial guidance")
+    print(f"  - Reconstruction Head: P2 (256ch) → RGB (3ch, Sigmoid→[0,1])")
+    print(f"  - DGFE: Learnable-threshold filtration + channel attention")
+    print(f"  - Loss: L1(r_img, img_inputs) + Faster R-CNN det losses")
     print(f"  - Learnable threshold: {config['learnable_thresh']:.6f} ({config['learnable_thresh'] * 255:.2f}/255)")
     
     # Optimizer

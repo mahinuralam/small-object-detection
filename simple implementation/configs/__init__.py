@@ -1,5 +1,3 @@
-from .base_config import BaseConfig
-from .baseline_config import BaselineConfig
-from .dpa_config import DPAConfig
+from .sahi_config import SAHIPipelineConfig, PRESETS, get_preset_config
 
-__all__ = ['BaseConfig', 'BaselineConfig', 'DPAConfig']
+__all__ = ['SAHIPipelineConfig', 'PRESETS', 'get_preset_config']

@@ -7,7 +7,11 @@ from .msfe_module import MultiScaleFeatureEnhancer
 from .feature_reconstructor import FeatureReconstructor
 from .dgff_module import DifferenceGuidedFeatureFusion
 
+# Dense-FPN neck
+from .dense_fpn import DenseFPN
+
 __all__ = [
     'SimplifiedDPAModule', 'ReconstructionHead', 'DGFE',
-    'MultiScaleFeatureEnhancer', 'FeatureReconstructor', 'DifferenceGuidedFeatureFusion'
+    'MultiScaleFeatureEnhancer', 'FeatureReconstructor', 'DifferenceGuidedFeatureFusion',
+    'DenseFPN',
 ]
