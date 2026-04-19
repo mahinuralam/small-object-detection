@@ -187,8 +187,9 @@ class VisDroneDataset(Dataset):
         if self.transforms is not None:
             image, target = self.transforms(image, target)
         else:
-            # Default: convert PIL to tensor
-            image = torch.from_numpy(np.array(image)).permute(2, 0, 1).float() / 255.0
+            # Default: PIL → tensor via raw bytes (no numpy C-ext dependency)
+            w, h = image.size
+            image = torch.ByteTensor(bytearray(image.tobytes())).reshape(h, w, 3).permute(2, 0, 1).float() / 255.0
         
         return image, target
     
