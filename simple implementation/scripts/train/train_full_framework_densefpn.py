@@ -8,12 +8,19 @@ Loss: L_det  +  λ_rec × L1(r_img, img_inputs)    (λ_rec = 0.1)
 Usage (from repo root):
     cd "simple implementation"
     conda activate cooolenv
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
-        python -u scripts/train/train_full_framework_densefpn.py 2>&1 | \\
+
+    # Single GPU:
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        python -u scripts/train/train_full_framework_densefpn.py 2>&1 | \
         tee results/outputs_full_framework_densefpn/train.log
 
-For the 3-5 epoch sanity check:
-    python scripts/train/train_full_framework_densefpn.py --sanity
+    # Multi-GPU (both RTX 3090s):
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+        torchrun --nproc_per_node=2 scripts/train/train_full_framework_densefpn.py 2>&1 | \
+        tee results/outputs_full_framework_densefpn/train.log
+
+    # Sanity check (3 epochs × 50 steps):
+    torchrun --nproc_per_node=2 scripts/train/train_full_framework_densefpn.py --sanity
 """
 
 import os
@@ -28,18 +35,38 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-import numpy as np
 from tqdm import tqdm
 
 # ── CUDA ──────────────────────────────────────────────────────────────
 assert torch.cuda.is_available(), (
     "CUDA not available. Activate cooolenv and verify GPU with nvidia-smi."
 )
-DEVICE = torch.device('cuda')
-print(f"[CUDA] GPU: {torch.cuda.get_device_name(0)} "
-      f"({torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB)")
+
+# ── Distributed init ───────────────────────────────────────────────────
+LOCAL_RANK  = int(os.environ.get("LOCAL_RANK", 0))
+WORLD_SIZE  = int(os.environ.get("WORLD_SIZE", 1))
+IS_DIST     = WORLD_SIZE > 1
+IS_MAIN     = LOCAL_RANK == 0   # rank-0 handles logging/saving
+
+if IS_DIST:
+    dist.init_process_group("nccl")
+    torch.cuda.set_device(LOCAL_RANK)
+
+DEVICE = torch.device(f"cuda:{LOCAL_RANK}")
+
+if IS_MAIN:
+    for i in range(torch.cuda.device_count()):
+        mem = torch.cuda.get_device_properties(i).total_memory / 1024**3
+        print(f"[CUDA] GPU {i}: {torch.cuda.get_device_name(i)} ({mem:.1f} GB)")
+    print(f"[DDP]  world_size={WORLD_SIZE}")
+
+# cuDNN auto-tuner — pick fastest kernels for fixed input sizes
+torch.backends.cudnn.benchmark = True
 
 # ── Paths ─────────────────────────────────────────────────────────────
 SCRIPT_DIR   = Path(__file__).resolve().parent
@@ -62,14 +89,14 @@ CONFIG = {
     # Model
     'num_classes':               11,      # 10 VisDrone classes + background
     'fpn_channels':              256,
-    'lambda_rec':                0.1,     # reconstruction loss weight
-    'pretrained_backbone':       True,    # COCO-pretrained standard FPN
+    'lambda_rec':                0.1,
+    'pretrained_backbone':       True,
     'trainable_backbone_layers': 3,
-    'use_checkpoint':            True,
+    'use_checkpoint':            False,   # not needed — 24 GB VRAM per GPU
 
     # Training
-    'batch_size':                2,
-    'accumulation_steps':        8,       # effective batch = 16
+    'batch_size':                4,       # per GPU (×2 GPUs = 8 imgs/step)
+    'accumulation_steps':        4,       # effective batch = 4×2×4 = 32
     'num_epochs':                50,
     'learning_rate':             1e-4,
     'backbone_lr':               1e-5,
@@ -81,8 +108,9 @@ CONFIG = {
     'augment_train':             True,
 
     # DataLoader
-    'train_workers':             6,
+    'train_workers':             8,
     'val_workers':               4,
+    'prefetch_factor':           2,
 
     # Paths
     'dataset_root':  str(PROJECT_ROOT.parent / 'dataset' / 'VisDrone-2018'),
@@ -95,8 +123,10 @@ CONFIG = {
 
 # ═══════════════════════ SEED ══════════════════════════════════════════
 def set_seed(seed: int = 42):
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed + LOCAL_RANK)
+    np.random.seed(seed + LOCAL_RANK)
+    torch.manual_seed(seed + LOCAL_RANK)
+    torch.cuda.manual_seed_all(seed + LOCAL_RANK)
 
 # ═══════════════════════ TRANSFORMS ════════════════════════════════════
 class TrainAugmentation:
@@ -109,7 +139,6 @@ class TrainAugmentation:
                 boxes = target['boxes'].clone()
                 boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
                 target['boxes'] = boxes
-        # PIL → tensor [0, 1] via raw bytes — no numpy C-ext dependency
         w, h = image.size
         image = torch.ByteTensor(bytearray(image.tobytes())).reshape(h, w, 3).permute(2, 0, 1).float() / 255.0
         return image, target
@@ -118,7 +147,7 @@ class TrainAugmentation:
 def get_transforms(train: bool):
     if train and CONFIG['augment_train']:
         return TrainAugmentation()
-    return None   # dataset handles PIL→tensor when transforms=None
+    return None
 
 # ═══════════════════════ COLLATE ═══════════════════════════════════════
 def collate_fn(batch):
@@ -129,27 +158,43 @@ def build_loaders():
     root = CONFIG['dataset_root']
     train_ds = VisDroneDataset(root, split='train', transforms=get_transforms(True))
     val_ds   = VisDroneDataset(root, split='val',   transforms=get_transforms(False))
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True)  if IS_DIST else None
+    val_sampler   = DistributedSampler(val_ds,   shuffle=False) if IS_DIST else None
+
     train_loader = DataLoader(
-        train_ds, batch_size=CONFIG['batch_size'],
-        shuffle=True, num_workers=CONFIG['train_workers'],
-        collate_fn=collate_fn, pin_memory=True,
+        train_ds,
+        batch_size=CONFIG['batch_size'],
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        num_workers=CONFIG['train_workers'],
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=CONFIG['prefetch_factor'],
     )
     val_loader = DataLoader(
-        val_ds, batch_size=CONFIG['batch_size'],
-        shuffle=False, num_workers=CONFIG['val_workers'],
-        collate_fn=collate_fn, pin_memory=True,
+        val_ds,
+        batch_size=CONFIG['batch_size'],
+        sampler=val_sampler,
+        shuffle=False,
+        num_workers=CONFIG['val_workers'],
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=CONFIG['prefetch_factor'],
     )
-    print(f"[Dataset] train={len(train_ds)}, val={len(val_ds)}")
-    return train_loader, val_loader
+    if IS_MAIN:
+        print(f"[Dataset] train={len(train_ds)}, val={len(val_ds)}")
+    return train_loader, val_loader, train_sampler
 
 # ═══════════════════════ OPTIMISER ═════════════════════════════════════
 def build_optimiser(model: nn.Module):
-    """Separate LR for backbone vs everything else."""
+    raw = model.module if IS_DIST else model
     backbone_params, head_params = [], []
-    for name, param in model.named_parameters():
+    for name, param in raw.named_parameters():
         if not param.requires_grad:
             continue
-        # Standard FPN backbone lives at base_model.backbone.*
         if 'base_model.backbone' in name:
             backbone_params.append(param)
         else:
@@ -178,26 +223,28 @@ def build_scheduler(optimiser, steps_per_epoch: int):
 # ═══════════════════════ TRAIN EPOCH ═══════════════════════════════════
 def train_epoch(model, loader, optimiser, scheduler, scaler, epoch, writer):
     model.train()
+    raw = model.module if IS_DIST else model
     total_losses = {}
     optimiser.zero_grad()
     acc = CONFIG['accumulation_steps']
+    max_steps = CONFIG.get('sanity_steps')
 
-    max_steps = CONFIG.get('sanity_steps')  # None = unlimited
+    # Freeze/unfreeze backbone once per epoch, not per step
+    freeze = epoch < CONFIG['freeze_backbone_epochs']
+    for p in raw.base_model.backbone.parameters():
+        p.requires_grad_(not freeze)
 
-    for step, (images, targets) in enumerate(
-        tqdm(loader, desc=f"Train E{epoch+1}", leave=False,
-             total=max_steps if max_steps else len(loader))
-    ):
+    pbar = tqdm(loader, desc=f"Train E{epoch+1}", leave=False,
+                total=max_steps if max_steps else len(loader),
+                disable=not IS_MAIN)
+
+    for step, (images, targets) in enumerate(pbar):
         if max_steps and step >= max_steps:
             break
 
-        images  = [img.to(DEVICE) for img in images]
-        targets = [{k: v.to(DEVICE) for k, v in t.items()} for t in targets]
+        images  = [img.to(DEVICE, non_blocking=True) for img in images]
 
-        # Freeze backbone for early epochs
-        freeze = epoch < CONFIG['freeze_backbone_epochs']
-        for p in model.base_model.backbone.parameters():
-            p.requires_grad_(not freeze)
+        targets = [{k: v.to(DEVICE, non_blocking=True) for k, v in t.items()} for t in targets]
 
         with torch.cuda.amp.autocast(enabled=CONFIG['use_amp']):
             loss_dict = model(images, targets)
@@ -207,9 +254,7 @@ def train_epoch(model, loader, optimiser, scheduler, scaler, epoch, writer):
 
         if (step + 1) % acc == 0:
             scaler.unscale_(optimiser)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), CONFIG['max_grad_norm']
-            )
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['max_grad_norm'])
             scaler.step(optimiser)
             scaler.update()
             optimiser.zero_grad()
@@ -222,27 +267,29 @@ def train_epoch(model, loader, optimiser, scheduler, scaler, epoch, writer):
     avg = {k: v / n for k, v in total_losses.items()}
     avg['total'] = sum(avg.values())
 
-    gstep = epoch * len(loader)
-    for k, v in avg.items():
-        writer.add_scalar(f'train/{k}', v, gstep)
+    if IS_MAIN:
+        gstep = epoch * len(loader)
+        for k, v in avg.items():
+            writer.add_scalar(f'train/{k}', v, gstep)
 
     return avg
 
 # ═══════════════════════ VAL EPOCH ═════════════════════════════════════
 def val_epoch(model, loader, epoch, writer):
-    model.train()   # keep train mode to get losses
+    model.train()
     total_losses = {}
     max_steps = CONFIG.get('sanity_steps')
 
     with torch.no_grad():
         for vstep, (images, targets) in enumerate(
             tqdm(loader, desc=f"Val   E{epoch+1}", leave=False,
-                 total=max_steps if max_steps else len(loader))
+                 total=max_steps if max_steps else len(loader),
+                 disable=not IS_MAIN)
         ):
             if max_steps and vstep >= max_steps:
                 break
-            images  = [img.to(DEVICE) for img in images]
-            targets = [{k: v.to(DEVICE) for k, v in t.items()} for t in targets]
+            images  = [img.to(DEVICE, non_blocking=True) for img in images]
+            targets = [{k: v.to(DEVICE, non_blocking=True) for k, v in t.items()} for t in targets]
             with torch.cuda.amp.autocast(enabled=CONFIG['use_amp']):
                 loss_dict = model(images, targets)
             for k, v in loss_dict.items():
@@ -252,9 +299,10 @@ def val_epoch(model, loader, epoch, writer):
     avg = {k: v / n for k, v in total_losses.items()}
     avg['total'] = sum(avg.values())
 
-    gstep = epoch * len(loader)
-    for k, v in avg.items():
-        writer.add_scalar(f'val/{k}', v, gstep)
+    if IS_MAIN:
+        gstep = epoch * len(loader)
+        for k, v in avg.items():
+            writer.add_scalar(f'val/{k}', v, gstep)
 
     return avg
 
@@ -262,29 +310,31 @@ def val_epoch(model, loader, epoch, writer):
 def main():
     set_seed(42)
     out_dir = Path(CONFIG['output_dir'])
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if IS_MAIN:
+        out_dir.mkdir(parents=True, exist_ok=True)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=CONFIG['num_epochs'])
     parser.add_argument('--sanity', action='store_true',
                         help='Quick sanity check: 3 epochs, 50 steps each')
-    parser.add_argument('--sanity-steps', type=int, default=50,
-                        help='Max steps per epoch in sanity mode')
+    parser.add_argument('--sanity-steps', type=int, default=50)
     args = parser.parse_args()
 
     if args.sanity:
-        CONFIG['num_epochs']      = 3
-        CONFIG['sanity_steps']    = args.sanity_steps
-        CONFIG['warmup_epochs']   = 0
-        print(f"[Sanity] 3 epochs × {args.sanity_steps} steps each")
+        CONFIG['num_epochs']    = 3
+        CONFIG['sanity_steps']  = args.sanity_steps
+        CONFIG['warmup_epochs'] = 0
+        if IS_MAIN:
+            print(f"[Sanity] 3 epochs × {args.sanity_steps} steps each")
     else:
         CONFIG['num_epochs']   = args.epochs
         CONFIG['sanity_steps'] = None
 
-    with open(out_dir / 'config.json', 'w') as f:
-        json.dump(CONFIG, f, indent=2)
+    if IS_MAIN:
+        with open(out_dir / 'config.json', 'w') as f:
+            json.dump(CONFIG, f, indent=2)
 
-    train_loader, val_loader = build_loaders()
+    train_loader, val_loader, train_sampler = build_loaders()
 
     model = FasterRCNN_FullFramework_DenseFPN(
         num_classes=CONFIG['num_classes'],
@@ -295,87 +345,103 @@ def main():
         use_checkpoint=CONFIG['use_checkpoint'],
     ).to(DEVICE)
 
+    if IS_DIST:
+        # True required because backbone is frozen for early epochs (no grads on those params)
+        model = DDP(model, device_ids=[LOCAL_RANK], find_unused_parameters=True)
+
     optimiser = build_optimiser(model)
     steps_per_epoch = CONFIG.get('sanity_steps') or len(train_loader)
     scheduler = build_scheduler(optimiser, steps_per_epoch)
     scaler    = torch.cuda.amp.GradScaler(enabled=CONFIG['use_amp'])
-    writer    = SummaryWriter(log_dir=str(out_dir / 'tensorboard'))
+    writer    = SummaryWriter(log_dir=str(out_dir / 'tensorboard')) if IS_MAIN else None
 
     # Resume
     start_epoch, best_val = 0, float('inf')
     ckpt_path = CONFIG.get('resume_checkpoint')
     if ckpt_path and Path(ckpt_path).exists():
         ck = torch.load(ckpt_path, map_location=DEVICE)
-        model.load_state_dict(ck['model_state_dict'])
+        raw = model.module if IS_DIST else model
+        raw.load_state_dict(ck['model_state_dict'])
         optimiser.load_state_dict(ck['optimiser_state_dict'])
         start_epoch = ck['epoch'] + 1
         best_val    = ck.get('best_val_loss', float('inf'))
-        print(f"[Resume] epoch {start_epoch}, best_val={best_val:.4f}")
+        if IS_MAIN:
+            print(f"[Resume] epoch {start_epoch}, best_val={best_val:.4f}")
 
     history  = []
     no_improve = 0
 
-    print(f"\n[Train] {CONFIG['num_epochs']} epochs, "
-          f"λ_rec={CONFIG['lambda_rec']}, "
-          f"batch={CONFIG['batch_size']}×{CONFIG['accumulation_steps']} eff.")
+    if IS_MAIN:
+        eff_batch = CONFIG['batch_size'] * WORLD_SIZE * CONFIG['accumulation_steps']
+        print(f"\n[Train] {CONFIG['num_epochs']} epochs, "
+              f"λ_rec={CONFIG['lambda_rec']}, "
+              f"batch={CONFIG['batch_size']}×{WORLD_SIZE}GPUs×{CONFIG['accumulation_steps']}acc "
+              f"= {eff_batch} eff.")
 
     for epoch in range(start_epoch, CONFIG['num_epochs']):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         t0 = time.time()
+        train_avg = train_epoch(model, train_loader, optimiser, scheduler, scaler, epoch, writer)
+        val_avg   = val_epoch(model, val_loader, epoch, writer)
+        elapsed   = time.time() - t0
 
-        train_avg = train_epoch(
-            model, train_loader, optimiser, scheduler, scaler, epoch, writer
-        )
-        val_avg = val_epoch(model, val_loader, epoch, writer)
+        if IS_MAIN:
+            print(
+                f"E{epoch+1:03d}/{CONFIG['num_epochs']} "
+                f"| train={train_avg['total']:.4f} "
+                f"| recon={train_avg.get('loss_reconstruction', 0):.4f} "
+                f"| val={val_avg['total']:.4f} "
+                f"| val_recon={val_avg.get('loss_reconstruction', 0):.4f} "
+                f"| {elapsed/60:.1f}min"
+            )
 
-        elapsed = time.time() - t0
-        print(
-            f"E{epoch+1:03d}/{CONFIG['num_epochs']} "
-            f"| train_total={train_avg['total']:.4f} "
-            f"| train_recon={train_avg.get('loss_reconstruction', 0):.4f} "
-            f"| val_total={val_avg['total']:.4f} "
-            f"| val_recon={val_avg.get('loss_reconstruction', 0):.4f} "
-            f"| {elapsed/60:.1f}min"
-        )
+            row = {'epoch': epoch + 1, 'train': train_avg, 'val': val_avg,
+                   'elapsed_s': elapsed}
+            history.append(row)
+            with open(out_dir / 'history.json', 'w') as f:
+                json.dump(history, f, indent=2)
 
-        row = {'epoch': epoch + 1, 'train': train_avg, 'val': val_avg,
-               'elapsed_s': elapsed}
-        history.append(row)
-        with open(out_dir / 'history.json', 'w') as f:
-            json.dump(history, f, indent=2)
+            raw = model.module if IS_DIST else model
+            ck = {
+                'epoch': epoch,
+                'model_state_dict': raw.state_dict(),
+                'optimiser_state_dict': optimiser.state_dict(),
+                'val_loss': val_avg['total'],
+                'best_val_loss': best_val,
+                'config': CONFIG,
+            }
+            torch.save(ck, out_dir / 'last_checkpoint.pth')
 
-        # Checkpoint
-        ck = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimiser_state_dict': optimiser.state_dict(),
-            'val_loss': val_avg['total'],
-            'best_val_loss': best_val,
-            'config': CONFIG,
-        }
-        torch.save(ck, out_dir / 'last_checkpoint.pth')
+            if val_avg['total'] < best_val:
+                best_val = val_avg['total']
+                no_improve = 0
+                torch.save(ck, out_dir / 'best_model.pth')
+                print(f"  ↑ New best val={best_val:.4f}")
+            else:
+                no_improve += 1
+                if no_improve >= CONFIG['early_stopping_patience']:
+                    print(f"[EarlyStop] {no_improve} epochs without improvement")
+                    break
 
-        if val_avg['total'] < best_val:
-            best_val = val_avg['total']
-            no_improve = 0
-            torch.save(ck, out_dir / 'best_model.pth')
-            print(f"  ↑ New best val={best_val:.4f}")
-        else:
-            no_improve += 1
-            if no_improve >= CONFIG['early_stopping_patience']:
-                print(f"[EarlyStop] {no_improve} epochs without improvement")
-                break
-
-        if args.sanity and (epoch + 1) >= 5:
-            for k, v in {**train_avg, **val_avg}.items():
-                if not isinstance(v, dict):
-                    assert torch.isfinite(torch.tensor(float(v))), \
-                        f"Non-finite in sanity check: {k}={v}"
-            print("\n[Sanity] 5-epoch sanity check PASSED — all losses finite")
+        if args.sanity and (epoch + 1) >= 3:
+            if IS_MAIN:
+                for k, v in {**train_avg, **val_avg}.items():
+                    if not isinstance(v, dict):
+                        assert torch.isfinite(torch.tensor(float(v))), \
+                            f"Non-finite in sanity check: {k}={v}"
+                print("\n[Sanity] Sanity check PASSED — all losses finite")
             break
 
-    writer.close()
-    print(f"\n[Done] Best val loss: {best_val:.4f}")
-    print(f"       Checkpoints in: {out_dir}")
+    if IS_DIST:
+        dist.destroy_process_group()
+
+    if IS_MAIN:
+        if writer:
+            writer.close()
+        print(f"\n[Done] Best val loss: {best_val:.4f}")
+        print(f"       Checkpoints in: {out_dir}")
 
 
 if __name__ == '__main__':
