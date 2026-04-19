@@ -23,6 +23,7 @@ Usage (from repo root):
     torchrun --nproc_per_node=2 scripts/train/train_full_framework_densefpn.py --sanity
 """
 
+import contextlib
 import os
 import sys
 import time
@@ -115,7 +116,7 @@ CONFIG = {
     # Paths
     'dataset_root':  str(PROJECT_ROOT.parent / 'dataset' / 'VisDrone-2018'),
     'output_dir':    str(PROJECT_ROOT / 'results' / 'outputs_full_framework_densefpn'),
-    'resume_checkpoint': None,
+    'resume_checkpoint': None,  # set via --resume or hardcode absolute path
 
     # Mixed precision
     'use_amp': True,
@@ -238,24 +239,48 @@ def train_epoch(model, loader, optimiser, scheduler, scaler, epoch, writer):
                 total=max_steps if max_steps else len(loader),
                 disable=not IS_MAIN)
 
+    nan_skips = 0
     for step, (images, targets) in enumerate(pbar):
         if max_steps and step >= max_steps:
             break
 
         images  = [img.to(DEVICE, non_blocking=True) for img in images]
-
         targets = [{k: v.to(DEVICE, non_blocking=True) for k, v in t.items()} for t in targets]
 
-        with torch.cuda.amp.autocast(enabled=CONFIG['use_amp']):
-            loss_dict = model(images, targets)
-            loss = sum(loss_dict.values()) / acc
+        is_sync = (step + 1) % acc == 0
+        # no_sync() skips DDP AllReduce on accumulation steps — avoids redundant
+        # communication and prevents NaN propagation through the gradient buffer
+        sync_ctx = contextlib.nullcontext() if (not IS_DIST or is_sync) else model.no_sync()
 
-        scaler.scale(loss).backward()
+        with sync_ctx:
+            with torch.cuda.amp.autocast(enabled=CONFIG['use_amp']):
+                loss_dict = model(images, targets)
+                # Skip if any loss component is non-finite
+                if not all(torch.isfinite(v) for v in loss_dict.values()):
+                    nan_skips += 1
+                    optimiser.zero_grad()
+                    if IS_MAIN:
+                        print(f"\n[Warn] Non-finite loss at step {step} "
+                              f"(skip #{nan_skips}): "
+                              + ", ".join(f"{k}={v.item():.4g}"
+                                          for k, v in loss_dict.items()))
+                    continue
+                loss = sum(loss_dict.values()) / acc
 
-        if (step + 1) % acc == 0:
+            scaler.scale(loss).backward()
+
+        if is_sync:
             scaler.unscale_(optimiser)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['max_grad_norm'])
-            scaler.step(optimiser)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), CONFIG['max_grad_norm']
+            )
+            if torch.isfinite(grad_norm):
+                scaler.step(optimiser)
+            else:
+                nan_skips += 1
+                if IS_MAIN:
+                    print(f"\n[Warn] Non-finite grad_norm={grad_norm:.4g} "
+                          f"at step {step} (skip #{nan_skips})")
             scaler.update()
             optimiser.zero_grad()
             scheduler.step()
@@ -318,7 +343,12 @@ def main():
     parser.add_argument('--sanity', action='store_true',
                         help='Quick sanity check: 3 epochs, 50 steps each')
     parser.add_argument('--sanity-steps', type=int, default=50)
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
     args = parser.parse_args()
+
+    if args.resume:
+        CONFIG['resume_checkpoint'] = args.resume
 
     if args.sanity:
         CONFIG['num_epochs']    = 3
