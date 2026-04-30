@@ -37,7 +37,7 @@ outputs/
 runs/
 checkpoints/
 logs/
-
+visualize/
 
 # ── GENERATED IMAGES & VIDEOS ───────────────────────────────
 *.png
@@ -125,3 +125,27 @@ Thumbs.db
 htmlcov/
 .pytest_cache/
 .hypothesis/
+
+
+# ── PROJECT-SPECIFIC ────────────────────────────────────────
+# Runtime logs and background process output
+nohup.out
+*.log.txt
+
+# TensorBoard info files
+.tensorboard-info/
+
+# Generated visualization folders (large PNG outputs)
+visualizations_*/
+results/visualizations_*/
+scripts/visualize/
+
+# Eval result JSON files (regeneratable)
+results/eval_*.json
+
+# Weak tile precomputed maps
+results/weak_tile_map_*.json
+
+# REFACTOR_PLAN.md and REFACTOR_NOTES.md (deleted, ensure ignored)
+REFACTOR_PLAN.md
+REFACTOR_NOTES.md

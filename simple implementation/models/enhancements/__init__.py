@@ -1,11 +1,8 @@
 from .reconstruction_head import ReconstructionHead
-from .dgfe_module import DGFE
+from .dgfe_module import DGFEModule
 from .dense_fpn import DenseFPN
-from .reconstruction_module import ReconstructionModule
-from .rgr_module import RGRModule
+from .cddpa_module import CDDPA
 
 __all__ = [
-    'ReconstructionHead', 'DGFE',
-    'DenseFPN',
-    'ReconstructionModule', 'RGRModule',
+    'ReconstructionHead', 'DGFEModule', 'DenseFPN', 'CDDPA',
 ]
